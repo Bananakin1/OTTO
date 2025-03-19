@@ -2,6 +2,7 @@
 import argparse
 import datetime
 import sys
+import csv
 from typing import Dict, List, Tuple
 
 import requests
@@ -19,26 +20,36 @@ ORGAN_LIFESPAN = {
 }
 
 # Expanded mapping for common US airports to their timezones
-AIRPORT_TIMEZONES = {
-    "HNL": "Pacific/Honolulu",
-    "SEA": "America/Los_Angeles",
-    "SFO": "America/Los_Angeles",
-    "SAN": "America/Los_Angeles",
-    "DCA": "America/New_York",
-    "JFK": "America/New_York",
-    "BOS": "America/New_York",
-    "LAX": "America/Los_Angeles",
-    "ORD": "America/Chicago",
-    "ATL": "America/New_York",
-    "DFW": "America/Chicago",
-    "DEN": "America/Denver",
-    "LGA": "America/New_York",
-    "EWR": "America/New_York",
-    "IAD": "America/New_York",
-    "PHX": "America/Phoenix",
-    "MIA": "America/New_York",
-    "CLT": "America/New_York"
-}
+def load_airport_timezones(filename="airports-extended.dat"):
+    """
+    Load airport timezone information from a data file.
+    
+    The file has the following columns:
+    - Column 5 (0-indexed 4): IATA code
+    - Column 12 (0-indexed 11): Timezone name
+    
+    Returns a dictionary mapping IATA codes to timezone strings.
+    """
+    airport_timezones = {}
+    try:
+        with open(filename, 'r', encoding='utf-8') as file:
+            reader = csv.reader(file)
+            for row in reader:
+                # Check if we have enough columns and there's a valid IATA code
+                if len(row) >= 12 and row[4]:
+                    iata_code = row[4]
+                    timezone = row[11]  # 0-indexed, so 11 is the 12th column
+                    if iata_code and timezone and iata_code != "\\N":  # Skip null IATA codes
+                        airport_timezones[iata_code] = timezone
+        return airport_timezones
+    except FileNotFoundError:
+        print(f"Error: Airport data file '{filename}' not found.")
+        return {}
+    except IOError as e:
+        print(f"Error reading airport data file: {e}")
+        return {}
+
+AIRPORT_TIMEZONES = load_airport_timezones()
 
 
 def load_api_key_from_file(filename="user_key") -> str:
@@ -59,6 +70,30 @@ def load_api_key_from_file(filename="user_key") -> str:
         return ""
     except IOError as e:
         print(f"Error reading API key file: {e}")
+        return ""
+
+
+def get_amadeus_access_token(api_key: str) -> str:
+    """
+    Retrieve the access token from the Amadeus API.
+    """
+    auth_url = "https://test.api.amadeus.com/v1/security/oauth2/token"
+    if ":" not in api_key:
+        print("Error: API key must be in the format 'client_id:client_secret'")
+        return ""
+    client_id, client_secret = api_key.split(":", 1)
+    auth_data = {
+        "grant_type": "client_credentials",
+        "client_id": client_id,
+        "client_secret": client_secret
+    }
+    try:
+        response = requests.post(auth_url, data=auth_data)
+        response.raise_for_status()
+        access_token = response.json().get("access_token")
+        return access_token
+    except requests.exceptions.RequestException as e:
+        print(f"Error retrieving access token: {e}")
         return ""
 
 
@@ -107,21 +142,9 @@ def search_amadeus(
     Search for flights using the Amadeus API.
     """
     try:
-        auth_url = "https://test.api.amadeus.com/v1/security/oauth2/token"
-        if ":" not in api_key:
-            print("Error: API key must be in the format 'client_id:client_secret'")
-            return []
-        client_id, client_secret = api_key.split(":", 1)
-        auth_data = {
-            "grant_type": "client_credentials",
-            "client_id": client_id,
-            "client_secret": client_secret
-        }
-        auth_response = requests.post(auth_url, data=auth_data)
-        auth_response.raise_for_status()
-        access_token = auth_response.json().get("access_token")
+        access_token = get_amadeus_access_token(api_key)
         if not access_token:
-            print("Error: Failed to obtain access token from Amadeus")
+            print("Error: Could not retrieve access token.")
             return []
         
         search_url = "https://test.api.amadeus.com/v2/shopping/flight-offers"
@@ -129,7 +152,7 @@ def search_amadeus(
         departure_date = current_datetime.strftime("%Y-%m-%d")
         current_hour = current_datetime.hour
         if current_hour >= 20:  # If it's 8 PM or later, adjust the departure date
-            tomorrow = current_datetime #+ datetime.timedelta(hours=4)
+            tomorrow = current_datetime + datetime.timedelta(hours=4)
             departure_date = tomorrow.strftime("%Y-%m-%d")
         params = {
             "originLocationCode": origin,
@@ -174,7 +197,11 @@ def search_amadeus(
                         tz_arr = gettz(AIRPORT_TIMEZONES.get(arr_airport, "UTC"))
                         arrival_time = arrival_time.replace(tzinfo=tz_arr)
                     
-                    duration_hours = (arrival_time - departure_time).total_seconds() / 3600
+                    arrival_utc = arrival_time.astimezone(datetime.timezone.utc)
+                    departure_utc = departure_time.astimezone(datetime.timezone.utc)
+
+                    # Calculate the duration in hours
+                    duration_hours = (arrival_utc - departure_utc).total_seconds() / 3600
                     
                     if first_segment:
                         flight["origin"] = dep_airport
@@ -209,8 +236,8 @@ def search_amadeus(
                     flight["destination"] = last_seg["arrival_airport"]
                     flight["arrival_time"] = last_seg["arrival_time"]
                     flight["arrival_time_parsed"] = last_seg["arrival_time_parsed"]
-                flight["total_duration_hours"] = round(flight["total_duration_hours"], 1)
-                if flight.get("origin") == origin and flight.get("destination") == destination:
+                    # Save the raw offer data for booking purposes
+                    flight["raw_offer"] = offer
                     flights.append(flight)
         
         return flights
@@ -220,7 +247,6 @@ def search_amadeus(
     except (ValueError, KeyError) as e:
         print(f"Error processing Amadeus API response: {e}")
         return []
-
 
 
 def filter_flights_by_lifespan(
@@ -342,6 +368,100 @@ def format_flight_output(flights: List[Dict]) -> str:
         lines.append("")
     return "\n".join(lines)
 
+def book_flight(flight: Dict, api_key: str) -> Dict:
+    """
+    Book a flight using the Amadeus booking API.
+    Uses the best flight option (i.e. the one with the highest remaining lifespan).
+    """
+    try:
+        access_token = get_amadeus_access_token(api_key)
+        if not access_token:
+            print("Error: Failed to obtain access token for booking")
+            return {}
+       
+        # STEP 1: Confirm pricing and availability
+        pricing_url = "https://test.api.amadeus.com/v1/shopping/flight-offers/pricing"
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json"
+        }
+        
+        # Create pricing request payload
+        pricing_payload = {
+            "data": {
+                "type": "flight-offers-pricing",
+                "flightOffers": [flight.get("raw_offer")]
+            }
+        }
+        
+        # Make pricing request
+        pricing_response = requests.post(pricing_url, headers=headers, json=pricing_payload)
+        pricing_response.raise_for_status()
+        
+        # Extract confirmed flight offers
+        flight_price_confirmed = pricing_response.json().get("data", {}).get("flightOffers", [])
+        if not flight_price_confirmed:
+            print("Error: No confirmed flight offers returned from pricing API")
+            return {}
+            
+        # STEP 2: Book the flight
+        booking_url = "https://test.api.amadeus.com/v1/booking/flight-orders"
+        
+        # Create complete traveler profile according to API requirements
+        traveler = {
+            "id": "1",
+            "dateOfBirth": "1982-01-16",
+            "name": {"firstName": "JORGE", "lastName": "GONZALES"},
+            "gender": "MALE",
+            "contact": {
+                "emailAddress": "vfizreal@gmail.com",
+                "phones": [
+                    {
+                        "deviceType": "MOBILE",
+                        "countryCallingCode": "1",
+                        "number": "4126896329",
+                    }
+                ],
+            },
+            "documents": [
+                {
+                    "documentType": "PASSPORT",
+                    "birthPlace": "Madrid",
+                    "issuanceLocation": "Madrid",
+                    "issuanceDate": "2015-04-14",
+                    "number": "00000000",
+                    "expiryDate": "2025-04-14",
+                    "issuanceCountry": "ES",
+                    "validityCountry": "ES",
+                    "nationality": "ES",
+                    "holder": True,
+                }
+            ],
+        }
+        
+        # Create booking payload
+        booking_payload = {
+            "data": {
+                "type": "flight-order",
+                "flightOffers": flight_price_confirmed,
+                "travelers": [traveler]
+            }
+        }
+        
+        # Make booking request
+        booking_response = requests.post(booking_url, headers=headers, json=booking_payload)
+        booking_response.raise_for_status()
+        booking_confirmation = booking_response.json()
+        
+        print("Booking successful!")
+        print("Booking Confirmation:")
+        print(booking_confirmation)
+        return booking_confirmation
+    except requests.exceptions.RequestException as e:
+        print(f"Error booking flight: {e}")
+        if hasattr(e, 'response') and e.response:
+            print(f"Response content: {e.response.text}")
+        return {}
 
 def main():
     args = parse_arguments()
@@ -361,10 +481,18 @@ def main():
         return
     
     print(f"Found {len(valid_flights)} valid flights.")
-    # Now ranking by minimizing remaining lifespan
     top_flights = rank_flights(valid_flights)
     print("\nTop recommended flights:")
     print(format_flight_output(top_flights))
+    
+    # Automatically book the best (top-ranked) flight option
+    best_flight = top_flights[0]
+    print("\nBooking the best flight option...")
+    booking_response = book_flight(best_flight, api_key)
+    if booking_response:
+        print("Flight booked successfully!")
+    else:
+        print("Booking failed.")
 
 
 if __name__ == "__main__":
